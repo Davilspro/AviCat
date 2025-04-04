@@ -1,25 +1,18 @@
 import fs from 'fs/promises';
-import { createReadStream } from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import pLimit from 'p-limit';
 
-const baseDir = '/mnt/Aviaserver/!Общая/!Авиатор. Каталог продукции';
+const baseDir = '/mnt/Aviaserver/!Общая/!Авиатор. Каталог продукции'; // Главная папка с категориями
 const jsonFile = './data.json';
-const limit = pLimit(20); // Увеличил лимит до 20
 
 async function getFileHash(filePath) {
-  return new Promise((resolve) => {
-    const hash = crypto.createHash('md5');
-    const stream = createReadStream(filePath);
-
-    stream.on('data', chunk => hash.update(chunk));
-    stream.on('end', () => resolve(hash.digest('hex')));
-    stream.on('error', err => {
-      console.error(`❌ Ошибка при чтении файла ${filePath}: ${err.message}`);
-      resolve(null);
-    });
-  });
+  try {
+    const content = await fs.readFile(filePath);
+    return crypto.createHash('md5').update(content).digest('hex');
+  } catch (error) {
+    console.error(`❌ Ошибка при чтении файла ${filePath}: ${error.message}`);
+    return null; // Возвращаем null в случае ошибки
+  }
 }
 
 function getFileType(filename) {
@@ -35,68 +28,79 @@ function getFileType(filename) {
 
 async function scanSubfolders(folder) {
   try {
-    const items = await fs.readdir(folder);
-    const tasks = items.map(async item => {
-      const itemPath = path.join(folder, item);
-      const stats = await fs.stat(itemPath);
-
-      if (stats.isFile()) {
-        return limit(async () => {
-          const hash = await getFileHash(itemPath);
-          return hash ? {
-            filename: item,
-            filepath: path.relative(baseDir, itemPath),
-            filehash: hash,
-            type: getFileType(item)
-          } : null;
-        });
-      } else if (stats.isDirectory()) {
-        return scanSubfolders(itemPath);
+    const items = await fs.readdir(folder, { withFileTypes: true });
+    const promises = items.map(async item => {
+      const itemPath = path.join(folder, item.name);
+      if (item.isFile()) {
+        const hash = await getFileHash(itemPath);
+        return hash ? {
+          filename: item.name,
+          filepath: path.relative(baseDir, itemPath),
+          filehash: hash,
+          type: getFileType(item.name)
+        } : null;
+      } else if (item.isDirectory()) {
+        console.log(`🔍 Поиск в папке: ${itemPath}`);
+        return scanSubfolders(itemPath); // Рекурсивно сканируем подкаталоги
       }
     });
-
-    const results = await Promise.all(tasks);
-    return results.flat().filter(Boolean);
+    const results = await Promise.all(promises);
+    return results.flat().filter(Boolean); // Преобразуем и фильтруем null
   } catch (error) {
     console.error(`❌ Ошибка при сканировании папки ${folder}: ${error.message}`);
-    return [];
+    return []; // Возвращаем пустой массив в случае ошибки
   }
 }
 
 async function scanFiles() {
   try {
-    const categories = await fs.readdir(baseDir);
-    let fileData = [];
+    const categories = await fs.readdir(baseDir, { withFileTypes: true });
+    const fileData = [];
 
     console.log('🚀 Начало сканирования файлов...');
 
-    for (const category of categories) {
-      const categoryPath = path.join(baseDir, category);
-      const stats = await fs.stat(categoryPath);
-      if (!stats.isDirectory()) continue;
-      console.log(`🔍 Обработка категории: ${category}`);
+    const categoryPromises = categories.map(async category => {
+      if (!category.isDirectory()) return;
 
-      const subcategories = await fs.readdir(categoryPath);
-      for (const subcategory of subcategories) {
-        const subcategoryPath = path.join(categoryPath, subcategory);
-        const stats = await fs.stat(subcategoryPath);
-        if (!stats.isDirectory()) continue;
-        console.log(`    🔸 Обработка подкатегории: ${subcategory}`);
+      console.log(`🔍 Обработка категории: ${category.name}`);
+      const categoryPath = path.join(baseDir, category.name);
+      const subcategories = await fs.readdir(categoryPath, { withFileTypes: true });
 
-        const products = await fs.readdir(subcategoryPath);
-        for (const product of products) {
-          const productPath = path.join(subcategoryPath, product);
-          const stats = await fs.stat(productPath);
-          if (!stats.isDirectory()) continue;
-          console.log(`    ➡️ Обработка товара: ${product}`);
+      const subcategoryPromises = subcategories.map(async subcategory => {
+        if (!subcategory.isDirectory()) return;
 
-          const productFiles = await scanSubfolders(productPath);
-          fileData.push({ category, subcategory, product, files: productFiles });
+        const subcategoryPath = path.join(categoryPath, subcategory.name);
+        if (/^\d/.test(subcategory.name)) { // Если имя начинается с цифры, обрабатываем как товар
+          console.log(`    ➡️ Обработка товара: ${subcategory.name}`);
+          const productFiles = await scanSubfolders(subcategoryPath);
+          return {
+            category: category.name,
+            subcategory: subcategory.name,
+            product: subcategory.name,
+            files: productFiles
+          };
+        } else {
+          console.log(`    🔸 Обработка подкатегории: ${subcategory.name}`);
+          const products = await fs.readdir(subcategoryPath, { withFileTypes: true });
+          const productPromises = products.map(async product => {
+            if (!product.isDirectory()) return;
+            const productPath = path.join(subcategoryPath, product.name);
+            const productFiles = await scanSubfolders(productPath);
+            return {
+              category: category.name,
+              subcategory: subcategory.name,
+              product: product.name,
+              files: productFiles
+            };
+          });
+          return (await Promise.all(productPromises)).filter(Boolean); // Фильтруем недействительные значения
         }
-      }
-    }
+      });
+      const subcategoryData = await Promise.all(subcategoryPromises);
+      fileData.push(...subcategoryData.filter(Boolean)); // Сохраняем данные
+    });
 
-    console.log(`📦 Собрано файлов: ${fileData.length}, начинаю запись...`);
+    await Promise.all(categoryPromises);
     await fs.writeFile(jsonFile, JSON.stringify(fileData, null, 2), 'utf8');
     console.log(`✅ Файлы успешно записаны в ${jsonFile}`);
   } catch (error) {
